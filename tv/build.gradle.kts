@@ -13,13 +13,23 @@ android {
         applicationId = "com.xpertxyz.sharetotv"
         minSdk = 28
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 5
+        versionName = "1.0.4b"
 
+    }
+
+    signingConfigs {
+        create("release") {
+            storeFile = file("/Users/pkStudio/Library/Mobile Documents/com~apple~CloudDocs/playStore/Couch Files/secret.jks")
+            storePassword = "Bpk@1108"
+            keyPassword = "Bpk@1108"
+            keyAlias = "key0"
+        }
     }
 
     buildTypes {
         release {
+            signingConfig = signingConfigs.getByName("release")
             optimization {
                 enable = false
             }

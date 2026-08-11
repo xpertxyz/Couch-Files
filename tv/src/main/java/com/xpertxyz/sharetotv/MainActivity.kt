@@ -47,6 +47,7 @@ import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.InsertDriveFile
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.MusicNote
+import androidx.compose.material.icons.outlined.Settings as SettingsIcon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -110,6 +111,7 @@ class MainActivity : ComponentActivity() {
     private var nsdManager: NsdManager? = null
     private var nsdListener: NsdManager.RegistrationListener? = null
     private var awaitingGrant = false
+    private var switchingToDownloads = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -120,14 +122,10 @@ class MainActivity : ComponentActivity() {
             setContent {
                 ShareToTVTheme {
                     Surface(modifier = Modifier.fillMaxSize(), shape = RectangleShape) {
-                        GrantScreen {
-                            startActivity(
-                                Intent(
-                                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                                    "package:$packageName".toUri(),
-                                ),
-                            )
-                        }
+                        GrantScreen(
+                            onAllow = { openAllFilesAccessSettings() },
+                            onSkip = { useAppStorage() },
+                        )
                     }
                 }
             }
@@ -149,7 +147,7 @@ class MainActivity : ComponentActivity() {
                             Text("Could not start the file server. Restart the app.")
                         }
                     } else {
-                        TvApp(started, base, name, localIp(), started.listeningPort)
+                        TvApp(started, base, name, localIp(), started.listeningPort, ::setStorageMode)
                     }
                 }
             }
@@ -164,24 +162,91 @@ class MainActivity : ComponentActivity() {
             awaitingGrant = false
             recreate()
         }
+        if (switchingToDownloads) {
+            switchingToDownloads = false
+            if (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) {
+                prefs().edit().putBoolean("useAppStorage", false).apply()
+                recreate()
+            } else {
+                Toast.makeText(this, "File access wasn't granted — staying on app storage", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private fun needsStorageGrant(): Boolean =
-        Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()
+        Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager() &&
+            !getSharedPreferences("couchfiles", MODE_PRIVATE).getBoolean("useAppStorage", false)
+
+    /** Some TVs (e.g. Hisense) ship without the per-app all-files settings page — fall back. */
+    private fun openAllFilesAccessSettings() {
+        val candidates = listOf(
+            Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, "package:$packageName".toUri()),
+            Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+        )
+        val opened = candidates.any { runCatching { startActivity(it) }.isSuccess }
+        if (!opened) {
+            Toast.makeText(
+                this,
+                "This TV has no file-access settings screen — using app storage instead",
+                Toast.LENGTH_LONG,
+            ).show()
+            useAppStorage()
+        }
+    }
+
+    /** Files go to the app-private folder; every feature keeps working, minus system-wide visibility. */
+    private fun useAppStorage() {
+        getSharedPreferences("couchfiles", MODE_PRIVATE).edit().putBoolean("useAppStorage", true).apply()
+        awaitingGrant = false
+        recreate()
+    }
+
+    private fun prefs() = getSharedPreferences("couchfiles", MODE_PRIVATE)
 
     /** Public Downloads so every file manager sees the files; pre-Android 11 TVs keep the app dir. */
     private fun baseDir(): File =
-        if (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) {
+        if (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager() &&
+            !prefs().getBoolean("useAppStorage", false)
+        ) {
             File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "CouchFiles")
         } else {
             File(getExternalFilesDir(null) ?: filesDir, "SharedFiles")
         }.apply { mkdirs() }
 
-    /** One-time move of files from pre-rename locations. Best-effort. */
+    /** From the storage settings dialog. */
+    private fun setStorageMode(useAppStorage: Boolean) {
+        if (useAppStorage) {
+            prefs().edit().putBoolean("useAppStorage", true).apply()
+            recreate()
+            return
+        }
+        if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) {
+            prefs().edit().putBoolean("useAppStorage", false).apply()
+            recreate()
+            return
+        }
+        // Need the grant first; only flip the preference once it's actually granted
+        switchingToDownloads = true
+        val opened = listOf(
+            Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, "package:$packageName".toUri()),
+            Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+        ).any { runCatching { startActivity(it) }.isSuccess }
+        if (!opened) {
+            switchingToDownloads = false
+            Toast.makeText(
+                this,
+                "This TV has no file-access settings screen — Downloads mode isn't available",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+    }
+
+    /** Files follow the active storage mode: pull from the other locations. Best-effort. */
     private fun migrateLegacyFiles(base: File) {
         val olds = listOf(
             File(getExternalFilesDir(null) ?: filesDir, "SharedFiles"),
             File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "ShareToTV"),
+            File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "CouchFiles"),
         )
         for (old in olds) {
             if (!old.isDirectory || old.canonicalPath == base.canonicalPath) continue
@@ -268,7 +333,7 @@ private fun localIp(): String =
 // ---------------------------------------------------------------------------
 
 @Composable
-fun GrantScreen(onAllow: () -> Unit) {
+fun GrantScreen(onAllow: () -> Unit, onSkip: () -> Unit) {
     Column(
         Modifier.fillMaxSize().background(DeepHarbor).padding(64.dp),
         verticalArrangement = Arrangement.Center,
@@ -281,22 +346,39 @@ fun GrantScreen(onAllow: () -> Unit) {
         )
         Spacer(Modifier.height(12.dp))
         Text(
-            "Received files will be kept in Downloads/ShareToTV, where every file manager on this TV can see them. " +
+            "Received files will be kept in Downloads/CouchFiles, where every file manager on this TV can see them. " +
                 "Android asks you to allow file access once for that.",
             style = MaterialTheme.typography.bodyLarge,
             color = MistDim,
         )
         Spacer(Modifier.height(24.dp))
-        BrandButton(onClick = onAllow) { Text("Allow file access") }
+        Row {
+            BrandButton(onClick = onAllow) { Text("Allow file access") }
+            Spacer(Modifier.width(12.dp))
+            BrandButton(onClick = onSkip) { Text("Use app storage instead") }
+        }
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "App storage keeps everything working, but other TV apps won't see the files.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MistDim,
+        )
     }
 }
 
 @Composable
-fun TvApp(server: FileServer, base: File, deviceName: String, ip: String, port: Int) {
+fun TvApp(
+    server: FileServer,
+    base: File,
+    deviceName: String,
+    ip: String,
+    port: Int,
+    onStorageChange: (Boolean) -> Unit,
+) {
     Row(Modifier.fillMaxSize().background(DeepHarbor)) {
         ConnectRail(server, base, deviceName, ip, port)
         Box(Modifier.width(1.dp).fillMaxHeight().background(HarborEdge))
-        FileManager(server, base, Modifier.weight(1f))
+        FileManager(server, base, Modifier.weight(1f), onStorageChange)
     }
 }
 
@@ -482,7 +564,12 @@ private fun TransferStatus(transfer: Transfer?) {
 private data class Entry(val file: File, val isDir: Boolean)
 
 @Composable
-private fun FileManager(server: FileServer, base: File, modifier: Modifier) {
+private fun FileManager(
+    server: FileServer,
+    base: File,
+    modifier: Modifier,
+    onStorageChange: (Boolean) -> Unit,
+) {
     val context = LocalContext.current
     val tick by server.filesChanged.collectAsState()
     var relPath by remember { mutableStateOf("") }
@@ -493,6 +580,7 @@ private fun FileManager(server: FileServer, base: File, modifier: Modifier) {
     var creatingFolder by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf<Entry?>(null) }
     var exitPrompt by remember { mutableStateOf(false) }
+    var storageDialog by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     var lastBack by remember { mutableLongStateOf(0L) }
 
@@ -540,6 +628,10 @@ private fun FileManager(server: FileServer, base: File, modifier: Modifier) {
                 Icon(Icons.Outlined.CreateNewFolder, contentDescription = null, Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
                 Text("New folder")
+            }
+            Spacer(Modifier.width(8.dp))
+            BrandButton(onClick = { storageDialog = true }) {
+                Icon(Icons.Outlined.SettingsIcon, contentDescription = "Storage settings", Modifier.size(18.dp))
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -655,6 +747,45 @@ private fun FileManager(server: FileServer, base: File, modifier: Modifier) {
                     BrandButton(onClick = { confirmDelete = null }, modifier = Modifier.weight(1f)) {
                         Text("Cancel")
                     }
+                }
+            }
+        }
+    }
+
+    if (storageDialog) {
+        val usingDownloads = base.absolutePath.contains("/Download/")
+        Dialog(onDismissRequest = { storageDialog = false }) {
+            Column(
+                Modifier.width(400.dp).background(HarborRaised, RoundedCornerShape(20.dp)).padding(24.dp),
+            ) {
+                Eyebrow("STORAGE LOCATION")
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    if (usingDownloads) "Downloads/CouchFiles" else "App storage",
+                    style = MaterialTheme.typography.titleLarge,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Downloads is visible to every app on this TV; app storage is private to Couch Files. " +
+                        "Your existing files move over when you switch.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MistDim,
+                )
+                Spacer(Modifier.height(20.dp))
+                if (!usingDownloads) {
+                    BrandButton(
+                        onClick = { storageDialog = false; onStorageChange(false) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Switch to Downloads/CouchFiles") }
+                } else {
+                    BrandButton(
+                        onClick = { storageDialog = false; onStorageChange(true) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Switch to app storage") }
+                }
+                Spacer(Modifier.height(8.dp))
+                BrandButton(onClick = { storageDialog = false }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Cancel")
                 }
             }
         }

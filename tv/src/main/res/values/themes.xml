@@ -1,6 +1,6 @@
 <resources>
     <style name="Theme.ShareToTV" parent="Theme.AppCompat.NoActionBar">
-        <item name="android:windowBackground">@color/deep_harbor</item>
+        <item name="android:windowBackground">@drawable/splash_background</item>
         <item name="android:colorBackground">@color/deep_harbor</item>
     </style>
 </resources>
