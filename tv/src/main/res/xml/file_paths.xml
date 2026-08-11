@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <external-path name="downloads" path="Download/CouchFiles" />
+    <external-files-path name="shared" path="SharedFiles" />
+    <files-path name="shared_internal" path="SharedFiles" />
+</paths>
