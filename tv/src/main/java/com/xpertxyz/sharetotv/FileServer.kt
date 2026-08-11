@@ -104,7 +104,8 @@ class FileServer(
         val dir = safeResolve(base, path)
         dir.mkdirs()
         val target = dedupe(dir, sanitize(rawName))
-        val tmp = File(dir, target.name + ".part")
+        // unique per-request staging file: concurrent uploads of the same name must never share one
+        val tmp = File(dir, target.name + "." + System.nanoTime() + ".part")
         try {
             tmp.outputStream().use { out ->
                 val buf = ByteArray(64 * 1024)
@@ -118,9 +119,12 @@ class FileServer(
                     incoming.value = Transfer(target.name, copied, total)
                 }
             }
-            if (!tmp.renameTo(target)) throw IOException("could not save ${target.name}")
-            onSaved(target)
-            incoming.value = Transfer(target.name, total, total, done = true)
+            // re-dedupe at finish: a concurrent same-name upload may have claimed the target
+            // ponytail: microsecond TOCTOU window remains, vs the whole-transfer race it replaces
+            val final = if (target.exists()) dedupe(dir, target.name) else target
+            if (!tmp.renameTo(final)) throw IOException("could not save ${final.name}")
+            onSaved(final)
+            incoming.value = Transfer(final.name, total, total, done = true)
             filesChanged.value++
             return newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "ok")
         } catch (e: Exception) {

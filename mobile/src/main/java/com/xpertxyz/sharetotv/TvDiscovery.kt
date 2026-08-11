@@ -30,7 +30,8 @@ class TvDiscovery(context: Context) {
                 nsd.resolveService(info, object : NsdManager.ResolveListener {
                     override fun onResolveFailed(i: NsdServiceInfo?, err: Int) {}
                     override fun onServiceResolved(i: NsdServiceInfo) {
-                        val host = i.host?.hostAddress ?: return
+                        // IPv4 only: an IPv6 literal (esp. link-local %scope) breaks the http URL
+                        val host = (i.host as? java.net.Inet4Address)?.hostAddress ?: return
                         val tv = Tv(i.serviceName, host, i.port)
                         tvs.value = tvs.value.filter { it.name != tv.name } + tv
                     }

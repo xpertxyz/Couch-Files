@@ -55,6 +55,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -92,6 +93,7 @@ import com.xpertxyz.sharetotv.ui.theme.Paper
 import com.xpertxyz.sharetotv.ui.theme.ShareToTVTheme
 import com.xpertxyz.sharetotv.ui.theme.SignalAmber
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.io.File
 import java.io.IOException
 import java.net.Inet4Address
@@ -107,12 +109,14 @@ class MainActivity : ComponentActivity() {
     private var server: FileServer? = null
     private var nsdManager: NsdManager? = null
     private var nsdListener: NsdManager.RegistrationListener? = null
+    private var awaitingGrant = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         if (needsStorageGrant()) {
+            awaitingGrant = true
             setContent {
                 ShareToTVTheme {
                     Surface(modifier = Modifier.fillMaxSize(), shape = RectangleShape) {
@@ -154,8 +158,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Came back from the all-files-access settings screen with the grant: start fresh
-        if (server == null && !needsStorageGrant()) recreate()
+        // Came back from the all-files-access settings screen with the grant: start fresh.
+        // Guarded by awaitingGrant so a server-start failure can't loop recreate() forever.
+        if (awaitingGrant && server == null && !needsStorageGrant()) {
+            awaitingGrant = false
+            recreate()
+        }
     }
 
     private fun needsStorageGrant(): Boolean =
@@ -200,6 +208,8 @@ class MainActivity : ComponentActivity() {
     private fun startServer(base: File, name: String): FileServer? {
         var result: FileServer? = null
         val t = Thread {
+            // sweep .part files orphaned by a crash/power-cut mid-upload
+            base.walkTopDown().filter { it.isFile && it.name.endsWith(".part") }.forEach { it.delete() }
             for (port in 8899..8905) {
                 try {
                     result = FileServer(port, base, name, onSaved = ::scan)
@@ -241,7 +251,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val SERVICE_TYPE = "_sharetotv._tcp."
-        const val SOCKET_TIMEOUT = 5000
+        const val SOCKET_TIMEOUT = 30_000
     }
 }
 
@@ -483,6 +493,7 @@ private fun FileManager(server: FileServer, base: File, modifier: Modifier) {
     var creatingFolder by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf<Entry?>(null) }
     var exitPrompt by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     var lastBack by remember { mutableLongStateOf(0L) }
 
     val transfer by server.incoming.collectAsState()
@@ -566,7 +577,12 @@ private fun FileManager(server: FileServer, base: File, modifier: Modifier) {
                         },
                         onLongClick = {
                             swallowClick = true
-                            selected = entry
+                            // open the dialog after the key-up: if it opened while the button is
+                            // still held, the release would click the dialog's focused button
+                            scope.launch {
+                                delay(250)
+                                selected = entry
+                            }
                         },
                         headlineContent = {
                             Text(entry.file.name, maxLines = 1, overflow = TextOverflow.Ellipsis)

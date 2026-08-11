@@ -122,7 +122,9 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        collectShared(intent)
+        // Only consume the launch intent once - a restored activity redelivers the original
+        // ACTION_SEND and would silently re-upload the same files
+        if (savedInstanceState == null) collectShared(intent)
         setContent {
             ShareToTVTheme {
                 AppScreen(sharedUris)
@@ -132,6 +134,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         collectShared(intent)
     }
 
@@ -152,6 +155,10 @@ enum class Status { RUNNING, DONE, FAILED }
 class TransferUi(val name: String, val total: Long, val toTv: Boolean) {
     var bytes by mutableLongStateOf(0L)
     var status by mutableStateOf(Status.RUNNING)
+
+    /** Read from the IO thread mid-copy; set on disconnect. */
+    @Volatile
+    var cancelled = false
 }
 
 private fun parseQr(text: String): Triple<String, Int, String>? {
@@ -200,13 +207,25 @@ fun AppScreen(sharedUris: MutableList<Uri>) {
         }
     }
 
+    fun disconnect() {
+        transfers.forEach { if (it.status == Status.RUNNING) it.cancelled = true }
+        client = null
+        tvName = ""
+        path = ""
+        transfers.clear()
+        listing = TvClient.Listing(emptyList(), emptyList())
+    }
+
     fun uploadAll(uris: List<Uri>) {
         val c = client ?: return
         val target = path
         scope.launch {
             uploadLock.withLock {
                 for (uri in uris) {
-                    val meta = runCatching { resolveMeta(context, uri) }.getOrNull()
+                    if (client !== c) break // disconnected mid-batch: drop the rest
+                    val meta = runCatching {
+                        withContext(Dispatchers.IO) { resolveMeta(context, uri) }
+                    }.getOrNull()
                     if (meta == null) {
                         toast("Could not read a selected file")
                         continue
@@ -216,13 +235,15 @@ fun AppScreen(sharedUris: MutableList<Uri>) {
                     runCatching {
                         withContext(Dispatchers.IO) {
                             context.contentResolver.openInputStream(meta.uri)!!.use { input ->
-                                c.upload(input, meta.name, meta.size, target) { item.bytes = it }
+                                c.upload(input, meta.name, meta.size, target, { item.cancelled }) {
+                                    item.bytes = it
+                                }
                             }
                         }
                     }.onSuccess { item.status = Status.DONE }
                         .onFailure {
                             item.status = Status.FAILED
-                            toast("Failed to send ${meta.name}: ${it.message}")
+                            if (!item.cancelled) toast("Failed to send ${meta.name}: ${it.message}")
                         }
                 }
             }
@@ -239,23 +260,31 @@ fun AppScreen(sharedUris: MutableList<Uri>) {
         scope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
-                    c.downloadToDownloads(context, p, file) { item.bytes = it }
+                    c.downloadToDownloads(context, p, file, { item.cancelled }) { item.bytes = it }
                 }
             }.onSuccess {
                 item.status = Status.DONE
                 toast("${file.name} saved to Downloads")
             }.onFailure {
                 item.status = Status.FAILED
-                toast("Download failed: ${it.message}")
+                if (!item.cancelled) toast("Download failed: ${it.message}")
             }
         }
     }
 
-    // Heartbeat so the TV knows a phone is connected (it hides its QR while we're around)
+    // Heartbeat: tells the TV a phone is connected (it hides its QR), and detects the TV
+    // going away - three consecutive failures drop the session with a message
     LaunchedEffect(client) {
         val c = client ?: return@LaunchedEffect
+        var failures = 0
         while (true) {
-            runCatching { withContext(Dispatchers.IO) { c.ping() } }
+            val ok = runCatching { withContext(Dispatchers.IO) { c.ping() } }.isSuccess
+            failures = if (ok) 0 else failures + 1
+            if (failures >= 3) {
+                toast("Lost connection to ${tvName.ifEmpty { "the TV" }}")
+                disconnect()
+                break
+            }
             delay(5000.milliseconds)
         }
     }
@@ -293,13 +322,7 @@ fun AppScreen(sharedUris: MutableList<Uri>) {
                         .onFailure { toast("Could not create folder: ${it.message}") }
                 }
             },
-            onDisconnect = {
-                client = null
-                tvName = ""
-                path = ""
-                transfers.clear()
-                listing = TvClient.Listing(emptyList(), emptyList())
-            },
+            onDisconnect = { disconnect() },
         )
     }
 }
@@ -660,7 +683,31 @@ private fun FilesTab(
     onDownload: (TvClient.RemoteFile) -> Unit,
 ) {
     val context = LocalContext.current
-    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
+    var confirmDownload by remember { mutableStateOf<TvClient.RemoteFile?>(null) }
+
+    confirmDownload?.let { f ->
+        AlertDialog(
+            onDismissRequest = { confirmDownload = null },
+            title = { Text("Download ${f.name}?") },
+            text = {
+                Text(
+                    "${Formatter.formatFileSize(context, f.size)} — it will be saved to this " +
+                        "phone's Downloads folder.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDownload(f)
+                        confirmDownload = null
+                    },
+                ) { Text("Download") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDownload = null }) { Text("Cancel") } },
+        )
+    }
+
+    LazyColumn(Modifier.fillMaxSize()) {
         item { Breadcrumbs(path, onNavigate) }
 
         if (listing.dirs.isEmpty() && listing.files.isEmpty()) {
@@ -703,7 +750,7 @@ private fun FilesTab(
             items(listing.files, key = { "f/${it.name}" }) { f ->
                 val active = transfers.firstOrNull { !it.toTv && it.name == f.name && it.status == Status.RUNNING }
                 Column(
-                    Modifier.fillMaxWidth().clickable { onDownload(f) }.padding(vertical = 12.dp),
+                    Modifier.fillMaxWidth().clickable { confirmDownload = f }.padding(vertical = 12.dp),
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(

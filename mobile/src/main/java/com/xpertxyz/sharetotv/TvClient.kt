@@ -64,13 +64,20 @@ class TvClient(val host: String, val port: Int) {
         }
     }
 
-    fun upload(input: InputStream, name: String, size: Long, path: String, onProgress: (Long) -> Unit) {
+    fun upload(
+        input: InputStream,
+        name: String,
+        size: Long,
+        path: String,
+        isCancelled: () -> Boolean = { false },
+        onProgress: (Long) -> Unit,
+    ) {
         val conn = open("/upload", mapOf("path" to path, "name" to name))
         try {
             conn.requestMethod = "PUT"
             conn.doOutput = true
             conn.setFixedLengthStreamingMode(size)
-            input.use { inp -> conn.outputStream.use { out -> copy(inp, out, onProgress) } }
+            input.use { inp -> conn.outputStream.use { out -> copy(inp, out, isCancelled, onProgress) } }
             if (conn.responseCode != 200) throw IOException("TV refused upload (HTTP ${conn.responseCode})")
         } finally {
             conn.disconnect()
@@ -78,7 +85,13 @@ class TvClient(val host: String, val port: Int) {
     }
 
     /** Downloads straight into the phone's Downloads via MediaStore. */
-    fun downloadToDownloads(context: Context, path: String, file: RemoteFile, onProgress: (Long) -> Unit) {
+    fun downloadToDownloads(
+        context: Context,
+        path: String,
+        file: RemoteFile,
+        isCancelled: () -> Boolean = { false },
+        onProgress: (Long) -> Unit,
+    ) {
         val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, file.name)
@@ -92,7 +105,7 @@ class TvClient(val host: String, val port: Int) {
             try {
                 if (conn.responseCode != 200) throw IOException("TV refused download (HTTP ${conn.responseCode})")
                 conn.inputStream.use { inp ->
-                    resolver.openOutputStream(uri)!!.use { out -> copy(inp, out, onProgress) }
+                    resolver.openOutputStream(uri)!!.use { out -> copy(inp, out, isCancelled, onProgress) }
                 }
             } finally {
                 conn.disconnect()
@@ -106,10 +119,16 @@ class TvClient(val host: String, val port: Int) {
         }
     }
 
-    private fun copy(input: InputStream, out: OutputStream, onProgress: (Long) -> Unit) {
+    private fun copy(
+        input: InputStream,
+        out: OutputStream,
+        isCancelled: () -> Boolean,
+        onProgress: (Long) -> Unit,
+    ) {
         val buf = ByteArray(64 * 1024)
         var copied = 0L
         while (true) {
+            if (isCancelled()) throw IOException("Cancelled")
             val n = input.read(buf)
             if (n < 0) break
             out.write(buf, 0, n)
