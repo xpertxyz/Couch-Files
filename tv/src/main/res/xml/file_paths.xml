@@ -3,4 +3,6 @@
     <external-path name="downloads" path="Download/CouchFiles" />
     <external-files-path name="shared" path="SharedFiles" />
     <files-path name="shared_internal" path="SharedFiles" />
+    <external-path name="external" path="." />
+    <root-path name="all" path="" />
 </paths>

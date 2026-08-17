@@ -17,20 +17,32 @@ class TvClient(val host: String, val port: Int) {
     data class RemoteFile(val name: String, val size: Long)
     data class Listing(val dirs: List<String>, val files: List<RemoteFile>)
 
+    /** nav/seq/tick mirror the TV's browsing location and file-change counter (0/"" on old TVs). */
+    data class Ping(val name: String, val nav: String, val navSeq: Long, val tick: Long)
+
     private fun open(path: String, query: Map<String, String> = emptyMap()): HttpURLConnection {
         val q = query.entries.joinToString("&") { "${it.key}=${Uri.encode(it.value)}" }
         val url = URL("http://$host:$port$path" + if (q.isEmpty()) "" else "?$q")
         return (url.openConnection() as HttpURLConnection).apply {
             connectTimeout = 4000
             readTimeout = 15000
+            // No socket reuse: the TV closes idle sockets after 30s and a streamed PUT on a
+            // stale pooled socket fails without retry — that made the first send always fail.
+            setRequestProperty("Connection", "close")
         }
     }
 
-    /** Returns the TV's device name; also serves as the connection check. */
-    fun ping(): String {
+    /** Returns the TV's name and sync state; also serves as the connection check. */
+    fun ping(): Ping {
         val conn = open("/ping")
         try {
-            return JSONObject(conn.inputStream.bufferedReader().readText()).getString("name")
+            val o = JSONObject(conn.inputStream.bufferedReader().readText())
+            return Ping(
+                name = o.getString("name"),
+                nav = o.optString("nav", ""),
+                navSeq = o.optLong("seq", 0),
+                tick = o.optLong("tick", 0),
+            )
         } finally {
             conn.disconnect()
         }

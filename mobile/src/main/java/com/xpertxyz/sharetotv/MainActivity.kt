@@ -140,9 +140,14 @@ class MainActivity : ComponentActivity() {
 
     private fun collectShared(intent: Intent?) {
         when (intent?.action) {
-            Intent.ACTION_SEND ->
-                IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
-                    ?.let { sharedUris.add(it) }
+            Intent.ACTION_SEND -> {
+                val stream = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+                if (stream != null) {
+                    sharedUris.add(stream)
+                } else {
+                    Toast.makeText(this, "Only files and media can be sent to the TV", Toast.LENGTH_LONG).show()
+                }
+            }
             Intent.ACTION_SEND_MULTIPLE ->
                 IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
                     ?.let { sharedUris.addAll(it) }
@@ -198,9 +203,9 @@ fun AppScreen(sharedUris: MutableList<Uri>) {
             val candidate = TvClient(host, port)
             runCatching {
                 withContext(Dispatchers.IO) { candidate.ping() to candidate.list("") }
-            }.onSuccess { (name, rootListing) ->
+            }.onSuccess { (ping, rootListing) ->
                 client = candidate
-                tvName = name
+                tvName = ping.name
                 path = ""
                 listing = rootListing
             }.onFailure { toast("Could not reach $host:$port — ${it.message}") }
@@ -216,9 +221,8 @@ fun AppScreen(sharedUris: MutableList<Uri>) {
         listing = TvClient.Listing(emptyList(), emptyList())
     }
 
-    fun uploadAll(uris: List<Uri>) {
+    fun uploadAll(uris: List<Uri>, target: String = path) {
         val c = client ?: return
-        val target = path
         scope.launch {
             uploadLock.withLock {
                 for (uri in uris) {
@@ -245,6 +249,12 @@ fun AppScreen(sharedUris: MutableList<Uri>) {
                             item.status = Status.FAILED
                             if (!item.cancelled) toast("Failed to send ${meta.name}: ${it.message}")
                         }
+                    // files spooled through the cache by resolveMeta are ours to clean up
+                    if (meta.uri.scheme == "file") {
+                        meta.uri.path?.let { p ->
+                            if (p.startsWith(context.cacheDir.path)) File(p).delete()
+                        }
+                    }
                 }
             }
             refresh()
@@ -272,29 +282,42 @@ fun AppScreen(sharedUris: MutableList<Uri>) {
         }
     }
 
-    // Heartbeat: tells the TV a phone is connected (it hides its QR), and detects the TV
-    // going away - three consecutive failures drop the session with a message
+    // Heartbeat: tells the TV a phone is connected (it hides its QR), detects the TV going
+    // away (three consecutive failures drop the session), and keeps the two screens in sync —
+    // the phone follows the TV's navigation (seq guards against stale echoes) and refreshes
+    // when files change on the TV side.
     LaunchedEffect(client) {
         val c = client ?: return@LaunchedEffect
         var failures = 0
+        var lastSeq = -1L
+        var lastTick = -1L
         while (true) {
-            val ok = runCatching { withContext(Dispatchers.IO) { c.ping() } }.isSuccess
-            failures = if (ok) 0 else failures + 1
+            val ping = runCatching { withContext(Dispatchers.IO) { c.ping() } }.getOrNull()
+            failures = if (ping != null) 0 else failures + 1
             if (failures >= 3) {
                 toast("Lost connection to ${tvName.ifEmpty { "the TV" }}")
                 disconnect()
                 break
             }
-            delay(5000.milliseconds)
+            if (ping != null) {
+                if (ping.navSeq != lastSeq && ping.nav.isNotEmpty() && ping.nav != path) {
+                    path = ping.nav
+                }
+                lastSeq = ping.navSeq
+                if (lastTick >= 0 && ping.tick != lastTick) refresh()
+                lastTick = ping.tick
+            }
+            delay(2000.milliseconds)
         }
     }
 
-    // Files arriving via the system Share sheet auto-send once connected
+    // Files arriving via the system Share sheet auto-send once connected; they always land
+    // in the TV's Couch Files folder so they're easy to find regardless of where anyone browses
     LaunchedEffect(client, sharedUris.size) {
         if (client != null && sharedUris.isNotEmpty()) {
             val batch = sharedUris.toList()
             sharedUris.clear()
-            uploadAll(batch)
+            uploadAll(batch, target = "")
         }
     }
 
@@ -499,9 +522,20 @@ private fun ConnectScreen(pendingShareCount: Int, onConnect: (String, Int) -> Un
                     color = MaterialTheme.colorScheme.primary,
                 )
             }
+            Text(
+                appVersion(context),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.align(Alignment.CenterHorizontally).padding(bottom = 8.dp),
+            )
         }
     }
 }
+
+private fun appVersion(context: Context): String = runCatching {
+    val pi = context.packageManager.getPackageInfo(context.packageName, 0)
+    "v${pi.versionName} (${pi.longVersionCode})"
+}.getOrDefault("")
 
 @Composable
 private fun RadarRow(found: Boolean) {
@@ -805,7 +839,7 @@ private fun TransfersTab(transfers: List<TransferUi>) {
             Spacer(Modifier.height(10.dp))
             Text("No transfers yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text(
-                "Sent files go to the TV's Downloads/CouchFiles folder; downloads land in this phone's Downloads.",
+                "Sent files go to the folder open on the TV; downloads land in this phone's Downloads.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -815,7 +849,7 @@ private fun TransfersTab(transfers: List<TransferUi>) {
             item {
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "To TV → Downloads/CouchFiles  •  From TV → this phone's Downloads",
+                    "To TV → the folder you're browsing  •  From TV → this phone's Downloads",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -833,7 +867,7 @@ private fun Breadcrumbs(path: String, onNavigate: (String) -> Unit) {
         Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        TextButton(onClick = { onNavigate("") }) { Text("Downloads/CouchFiles") }
+        TextButton(onClick = { onNavigate("") }) { Text("TV") }
         if (path.isNotEmpty()) {
             var acc = ""
             path.split('/').forEach { segment ->

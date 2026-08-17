@@ -1,8 +1,12 @@
 package com.xpertxyz.sharetotv
 
+import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.storage.StorageManager
+import androidx.activity.result.contract.ActivityResultContracts
 import android.graphics.Bitmap
 import android.media.MediaScannerConnection
 import android.net.Uri
@@ -47,7 +51,6 @@ import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.InsertDriveFile
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.MusicNote
-import androidx.compose.material.icons.outlined.Settings as SettingsIcon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -111,7 +114,53 @@ class MainActivity : ComponentActivity() {
     private var nsdManager: NsdManager? = null
     private var nsdListener: NsdManager.RegistrationListener? = null
     private var awaitingGrant = false
-    private var switchingToDownloads = false
+
+    /** Ordinary storage/media permissions — the fallback when the all-files settings screen is missing. */
+    private val storagePerms: Array<String> = when {
+        Build.VERSION.SDK_INT >= 33 -> arrayOf(
+            Manifest.permission.READ_MEDIA_IMAGES,
+            Manifest.permission.READ_MEDIA_VIDEO,
+            Manifest.permission.READ_MEDIA_AUDIO,
+        )
+        Build.VERSION.SDK_INT >= 30 -> arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+        else -> arrayOf(
+            Manifest.permission.READ_EXTERNAL_STORAGE,
+            Manifest.permission.WRITE_EXTERNAL_STORAGE,
+        )
+    }
+
+    private val readAccessLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+            val granted = grants.values.any { it }
+            if (!granted) {
+                Toast.makeText(
+                    this,
+                    "File access denied — showing the Couch Files folder only",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+            if (granted || awaitingGrant) {
+                awaitingGrant = false
+                recreate()
+            }
+        }
+
+    /** All-files grant (full read/write) or the plain storage permission (browse + media files). */
+    private fun canBrowseDevice(): Boolean =
+        (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) ||
+            storagePerms.any { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
+
+    /** Whole internal storage plus any mounted USB drives. */
+    private fun deviceRoots(): List<Root> = buildList {
+        add(Root("Device storage", Environment.getExternalStorageDirectory()))
+        if (Build.VERSION.SDK_INT >= 30) {
+            getSystemService(StorageManager::class.java).storageVolumes
+                .filter { it.isRemovable && it.state == Environment.MEDIA_MOUNTED }
+                .forEach { v ->
+                    v.directory?.let { add(Root(v.getDescription(this@MainActivity) ?: "USB drive", it)) }
+                }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -135,7 +184,10 @@ class MainActivity : ComponentActivity() {
         val base = baseDir()
         migrateLegacyFiles(base)
         val name = deviceName()
-        val started = startServer(base, name)
+        val uiRoots = listOf(Root("Couch Files", base)) + deviceRoots()
+        // Only expose device roots to the phone when this TV can actually read them
+        val serverRoots = if (canBrowseDevice()) uiRoots else uiRoots.take(1)
+        val started = startServer(serverRoots, base, name)
         server = started
         started?.let { registerService(it.listeningPort, name) }
 
@@ -147,7 +199,12 @@ class MainActivity : ComponentActivity() {
                             Text("Could not start the file server. Restart the app.")
                         }
                     } else {
-                        TvApp(started, base, name, localIp(), started.listeningPort, ::setStorageMode)
+                        TvApp(
+                            started, base, name, localIp(), started.listeningPort,
+                            roots = uiRoots,
+                            canBrowse = canBrowseDevice(),
+                            onRequestAccess = { readAccessLauncher.launch(storagePerms) },
+                        )
                     }
                 }
             }
@@ -161,15 +218,6 @@ class MainActivity : ComponentActivity() {
         if (awaitingGrant && server == null && !needsStorageGrant()) {
             awaitingGrant = false
             recreate()
-        }
-        if (switchingToDownloads) {
-            switchingToDownloads = false
-            if (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) {
-                prefs().edit().putBoolean("useAppStorage", false).apply()
-                recreate()
-            } else {
-                Toast.makeText(this, "File access wasn't granted — staying on app storage", Toast.LENGTH_LONG).show()
-            }
         }
     }
 
@@ -185,12 +233,16 @@ class MainActivity : ComponentActivity() {
         )
         val opened = candidates.any { runCatching { startActivity(it) }.isSuccess }
         if (!opened) {
+            // No all-files screen on this TV (e.g. Hisense): the standard permission
+            // dialog still exists — ask for that so browsing works, and keep received
+            // files in app storage since Downloads isn't writable without the grant.
             Toast.makeText(
                 this,
-                "This TV has no file-access settings screen — using app storage instead",
+                "This TV hides the all-files screen — asking for standard file access instead",
                 Toast.LENGTH_LONG,
             ).show()
-            useAppStorage()
+            prefs().edit().putBoolean("useAppStorage", true).apply()
+            readAccessLauncher.launch(storagePerms)
         }
     }
 
@@ -203,43 +255,13 @@ class MainActivity : ComponentActivity() {
 
     private fun prefs() = getSharedPreferences("couchfiles", MODE_PRIVATE)
 
-    /** Public Downloads so every file manager sees the files; pre-Android 11 TVs keep the app dir. */
+    /** Automatic: public Downloads whenever the all-files grant is held, app storage otherwise. */
     private fun baseDir(): File =
-        if (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager() &&
-            !prefs().getBoolean("useAppStorage", false)
-        ) {
+        if (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) {
             File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "CouchFiles")
         } else {
             File(getExternalFilesDir(null) ?: filesDir, "SharedFiles")
         }.apply { mkdirs() }
-
-    /** From the storage settings dialog. */
-    private fun setStorageMode(useAppStorage: Boolean) {
-        if (useAppStorage) {
-            prefs().edit().putBoolean("useAppStorage", true).apply()
-            recreate()
-            return
-        }
-        if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) {
-            prefs().edit().putBoolean("useAppStorage", false).apply()
-            recreate()
-            return
-        }
-        // Need the grant first; only flip the preference once it's actually granted
-        switchingToDownloads = true
-        val opened = listOf(
-            Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, "package:$packageName".toUri()),
-            Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
-        ).any { runCatching { startActivity(it) }.isSuccess }
-        if (!opened) {
-            switchingToDownloads = false
-            Toast.makeText(
-                this,
-                "This TV has no file-access settings screen — Downloads mode isn't available",
-                Toast.LENGTH_LONG,
-            ).show()
-        }
-    }
 
     /** Files follow the active storage mode: pull from the other locations. Best-effort. */
     private fun migrateLegacyFiles(base: File) {
@@ -270,14 +292,14 @@ class MainActivity : ComponentActivity() {
     }
 
     /** Fixed port range so the address shown on screen is typeable; NSD advertises whichever bound. */
-    private fun startServer(base: File, name: String): FileServer? {
+    private fun startServer(roots: List<Root>, base: File, name: String): FileServer? {
         var result: FileServer? = null
         val t = Thread {
-            // sweep .part files orphaned by a crash/power-cut mid-upload
+            // sweep .part files orphaned by a crash/power-cut mid-upload (own folder only)
             base.walkTopDown().filter { it.isFile && it.name.endsWith(".part") }.forEach { it.delete() }
             for (port in 8899..8905) {
                 try {
-                    result = FileServer(port, base, name, onSaved = ::scan)
+                    result = FileServer(port, roots, name, onSaved = ::scan)
                         .also { it.start(SOCKET_TIMEOUT, false) }
                     break
                 } catch (_: IOException) {
@@ -319,6 +341,11 @@ class MainActivity : ComponentActivity() {
         const val SOCKET_TIMEOUT = 30_000
     }
 }
+
+fun appVersion(context: Context): String = runCatching {
+    val pi = context.packageManager.getPackageInfo(context.packageName, 0)
+    "v${pi.versionName} (${pi.longVersionCode})"
+}.getOrDefault("")
 
 private fun localIp(): String =
     NetworkInterface.getNetworkInterfaces().asSequence()
@@ -373,12 +400,14 @@ fun TvApp(
     deviceName: String,
     ip: String,
     port: Int,
-    onStorageChange: (Boolean) -> Unit,
+    roots: List<Root>,
+    canBrowse: Boolean,
+    onRequestAccess: () -> Unit,
 ) {
     Row(Modifier.fillMaxSize().background(DeepHarbor)) {
         ConnectRail(server, base, deviceName, ip, port)
         Box(Modifier.width(1.dp).fillMaxHeight().background(HarborEdge))
-        FileManager(server, base, Modifier.weight(1f), onStorageChange)
+        FileManager(server, base, Modifier.weight(1f), roots, canBrowse, onRequestAccess)
     }
 }
 
@@ -465,6 +494,12 @@ private fun ConnectRail(server: FileServer, base: File, deviceName: String, ip: 
                     color = MistDim,
                     maxLines = 1,
                 )
+                Text(
+                    appVersion(context),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MistDim,
+                    maxLines = 1,
+                )
             }
 
         }
@@ -476,14 +511,15 @@ private fun ConnectRail(server: FileServer, base: File, deviceName: String, ip: 
 private fun BrandButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    active: Boolean = false,
     content: @Composable RowScope.() -> Unit,
 ) {
     Button(
         onClick = onClick,
         modifier = modifier,
         colors = ButtonDefaults.colors(
-            containerColor = HarborEdge,
-            contentColor = Mist,
+            containerColor = if (active) HarborRaised else HarborEdge,
+            contentColor = if (active) SignalAmber else Mist,
             focusedContainerColor = SignalAmber,
             focusedContentColor = AmberDeep,
         ),
@@ -568,40 +604,64 @@ private fun FileManager(
     server: FileServer,
     base: File,
     modifier: Modifier,
-    onStorageChange: (Boolean) -> Unit,
+    roots: List<Root>,
+    canBrowse: Boolean,
+    onRequestAccess: () -> Unit,
 ) {
     val context = LocalContext.current
     val tick by server.filesChanged.collectAsState()
+    var rootIndex by remember { mutableIntStateOf(0) }
+    val root = roots[rootIndex]
     var relPath by remember { mutableStateOf("") }
-    var localBump by remember { mutableIntStateOf(0) }
     var entries by remember { mutableStateOf(emptyList<Entry>()) }
     var selected by remember { mutableStateOf<Entry?>(null) }
     var renaming by remember { mutableStateOf<Entry?>(null) }
     var creatingFolder by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf<Entry?>(null) }
     var exitPrompt by remember { mutableStateOf(false) }
-    var storageDialog by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     var lastBack by remember { mutableLongStateOf(0L) }
 
     val transfer by server.incoming.collectAsState()
     val receiving = transfer?.let { !it.done && !it.failed } == true
     val activity = LocalActivity.current
-    val baseLabel =
-        if (base.absolutePath.contains("/Download/")) "Downloads / CouchFiles" else "App storage"
+    val baseLabel = when {
+        rootIndex != 0 -> root.label
+        base.absolutePath.contains("/Download/") -> "Downloads / CouchFiles"
+        else -> "App storage"
+    }
 
-    val currentDir = if (relPath.isEmpty()) base else File(base, relPath)
+    val currentDir = if (relPath.isEmpty()) root.dir else File(root.dir, relPath)
 
-    LaunchedEffect(tick, relPath, localBump) {
+    LaunchedEffect(tick, relPath, rootIndex) {
         entries = currentDir.listFiles()
             ?.filter { !it.name.endsWith(".part") }
             ?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
             ?.map { Entry(it, it.isDirectory) } ?: emptyList()
     }
 
+    // Two-way sync with the phone: report where this TV is, follow where the phone goes.
+    val vpath = root.label + if (relPath.isEmpty()) "" else "/$relPath"
+    LaunchedEffect(vpath) { server.reportTvNav(vpath) }
+    LaunchedEffect(Unit) {
+        server.phoneNav.collect { nav ->
+            if (nav.seq == 0L || nav.path.isEmpty()) return@collect
+            val first = nav.path.substringBefore('/')
+            val i = roots.indexOfFirst { it.label == first }
+            val (ri, rp) = if (i >= 0) i to nav.path.substringAfter('/', "") else 0 to nav.path
+            val target = roots[ri].label + if (rp.isEmpty()) "" else "/$rp"
+            val current = roots[rootIndex].label + if (relPath.isEmpty()) "" else "/$relPath"
+            if (target != current) {
+                rootIndex = ri
+                relPath = rp
+            }
+        }
+    }
+
     BackHandler {
         when {
             relPath.isNotEmpty() -> relPath = relPath.substringBeforeLast('/', "")
+            rootIndex != 0 -> rootIndex = 0
             receiving -> exitPrompt = true
             System.currentTimeMillis() - lastBack < 2000 -> activity?.finish()
             else -> {
@@ -620,7 +680,11 @@ private fun FileManager(
                 )
                 Spacer(Modifier.height(2.dp))
                 Text(
-                    if (relPath.isEmpty()) "All files" else relPath.substringAfterLast('/'),
+                    when {
+                        relPath.isNotEmpty() -> relPath.substringAfterLast('/')
+                        rootIndex == 0 -> "All files"
+                        else -> root.label
+                    },
                     style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.Light),
                 )
             }
@@ -629,9 +693,20 @@ private fun FileManager(
                 Spacer(Modifier.width(8.dp))
                 Text("New folder")
             }
-            Spacer(Modifier.width(8.dp))
-            BrandButton(onClick = { storageDialog = true }) {
-                Icon(Icons.Outlined.SettingsIcon, contentDescription = "Storage settings", Modifier.size(18.dp))
+        }
+        Spacer(Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            roots.forEachIndexed { i, r ->
+                BrandButton(onClick = {
+                    if (i != 0 && !canBrowse) {
+                        onRequestAccess()
+                    } else {
+                        rootIndex = i
+                        relPath = ""
+                    }
+                }, active = i == rootIndex) {
+                    Text(r.label)
+                }
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -645,8 +720,12 @@ private fun FileManager(
                 Icon(Icons.Outlined.Folder, contentDescription = null, Modifier.size(48.dp), tint = HarborEdge)
                 Spacer(Modifier.height(12.dp))
                 Text("Nothing here yet", color = MistDim)
-                Text("Send files from your phone and they land in this folder.", color = MistDim,
-                    style = MaterialTheme.typography.bodySmall)
+                Text(
+                    if (rootIndex == 0) "Send files from your phone and they land in this folder."
+                    else "Nothing visible in this folder.",
+                    color = MistDim,
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
         } else {
             val dateFmt = remember { SimpleDateFormat("d MMM yyyy", Locale.getDefault()) }
@@ -662,7 +741,7 @@ private fun FileManager(
                             if (swallowClick) {
                                 swallowClick = false
                             } else if (entry.isDir) {
-                                relPath = rel(base, entry.file)
+                                relPath = rel(root.dir, entry.file)
                             } else {
                                 selected = entry
                             }
@@ -705,7 +784,7 @@ private fun FileManager(
             onDismiss = { selected = null },
             onOpen = {
                 selected = null
-                if (entry.isDir) relPath = rel(base, entry.file) else openFile(context, entry.file)
+                if (entry.isDir) relPath = rel(root.dir, entry.file) else openFile(context, entry.file)
             },
             onRename = { selected = null; renaming = entry },
             onDelete = { selected = null; confirmDelete = entry },
@@ -736,10 +815,14 @@ private fun FileManager(
                 Row {
                     BrandButton(
                         onClick = {
-                            if (entry.isDir) entry.file.deleteRecursively() else entry.file.delete()
-                            MediaScannerConnection.scanFile(context, arrayOf(entry.file.absolutePath), null, null)
+                            val ok = if (entry.isDir) entry.file.deleteRecursively() else entry.file.delete()
+                            if (ok) {
+                                MediaScannerConnection.scanFile(context, arrayOf(entry.file.absolutePath), null, null)
+                            } else {
+                                Toast.makeText(context, "Could not delete — this TV only lets Couch Files change its own files", Toast.LENGTH_LONG).show()
+                            }
                             confirmDelete = null
-                            localBump++
+                            server.bumpFiles()
                         },
                         modifier = Modifier.weight(1f),
                     ) { Text("Delete") }
@@ -747,45 +830,6 @@ private fun FileManager(
                     BrandButton(onClick = { confirmDelete = null }, modifier = Modifier.weight(1f)) {
                         Text("Cancel")
                     }
-                }
-            }
-        }
-    }
-
-    if (storageDialog) {
-        val usingDownloads = base.absolutePath.contains("/Download/")
-        Dialog(onDismissRequest = { storageDialog = false }) {
-            Column(
-                Modifier.width(400.dp).background(HarborRaised, RoundedCornerShape(20.dp)).padding(24.dp),
-            ) {
-                Eyebrow("STORAGE LOCATION")
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    if (usingDownloads) "Downloads/CouchFiles" else "App storage",
-                    style = MaterialTheme.typography.titleLarge,
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "Downloads is visible to every app on this TV; app storage is private to Couch Files. " +
-                        "Your existing files move over when you switch.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MistDim,
-                )
-                Spacer(Modifier.height(20.dp))
-                if (!usingDownloads) {
-                    BrandButton(
-                        onClick = { storageDialog = false; onStorageChange(false) },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text("Switch to Downloads/CouchFiles") }
-                } else {
-                    BrandButton(
-                        onClick = { storageDialog = false; onStorageChange(true) },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text("Switch to app storage") }
-                }
-                Spacer(Modifier.height(8.dp))
-                BrandButton(onClick = { storageDialog = false }, modifier = Modifier.fillMaxWidth()) {
-                    Text("Cancel")
                 }
             }
         }
@@ -845,7 +889,7 @@ private fun FileManager(
                 )
             }
             renaming = null
-            localBump++
+            server.bumpFiles()
         }
     }
 
@@ -861,7 +905,7 @@ private fun FileManager(
                 Toast.makeText(context, "Could not create folder", Toast.LENGTH_SHORT).show()
             }
             creatingFolder = false
-            localBump++
+            server.bumpFiles()
         }
     }
 }

@@ -18,19 +18,27 @@ data class Transfer(
     val failed: Boolean = false,
 )
 
+/** A browsable storage root; the first path segment of a request selects one by label. */
+data class Root(val label: String, val dir: File)
+
+/** A navigation event: virtual path plus a sequence number so followers can skip stale state. */
+data class Nav(val path: String, val seq: Long)
+
 /**
- * Folder-aware file server over [base].
- *   GET  /ping                    -> {"name": deviceName}
+ * Folder-aware file server over one or more [roots].
+ *   GET  /ping                    -> {"name","nav","seq","tick"} — TV name + TV location + change counter
  *   GET  /list?path=rel           -> {"dirs":[...], "files":[{"name","size","mtime"}]}
  *   GET  /download?path=rel/f.txt -> file stream
- *   PUT  /upload?path=rel&name=f  -> raw body saved into base/rel
+ *   PUT  /upload?path=rel&name=f  -> raw body saved into the resolved folder
  *   POST /mkdir?path=rel/new
- * Every path is canonicalized and must stay inside [base].
+ * Paths are virtual: "" lists the roots, "<label>/rest" resolves inside that root, and any
+ * other first segment lives in roots[0] (keeps older phone apps working). Every resolved
+ * path is canonicalized and must stay inside its root.
  */
 // ponytail: no auth — anyone on the same Wi-Fi can push/pull files. Add a pairing PIN if that matters.
 class FileServer(
     port: Int,
-    private val base: File,
+    private val roots: List<Root>,
     private val deviceName: String,
     private val onSaved: (File) -> Unit = {},
 ) : NanoHTTPD(port) {
@@ -44,14 +52,46 @@ class FileServer(
     /** Wall-clock millis of the last request from any client — the phone's heartbeat. */
     val lastSeen = MutableStateFlow(0L)
 
+    /** Where the phone last browsed (set on every /list) — the TV UI follows this. */
+    val phoneNav = MutableStateFlow(Nav("", 0))
+
+    /** Where the TV UI is — served to the phone in /ping so it can follow. */
+    val tvNav = MutableStateFlow(Nav("", 0))
+
+    fun reportTvNav(path: String) {
+        if (tvNav.value.path != path) tvNav.value = Nav(path, tvNav.value.seq + 1)
+    }
+
+    fun bumpFiles() {
+        filesChanged.value++
+    }
+
+    /** First segment selects a root by label; anything else lives in roots[0]. */
+    internal fun resolve(vpath: String): File {
+        val clean = vpath.trim('/')
+        if (clean.isEmpty()) return roots[0].dir
+        val root = roots.firstOrNull { it.label == clean.substringBefore('/') }
+            ?: return safeResolve(roots[0].dir, clean)
+        return safeResolve(root.dir, clean.substringAfter('/', ""))
+    }
+
     override fun serve(session: IHTTPSession): Response {
         lastSeen.value = System.currentTimeMillis()
         val path = session.parms["path"] ?: ""
         return try {
             when {
                 session.method == Method.GET && session.uri == "/ping" ->
-                    json(JSONObject().put("name", deviceName))
-                session.method == Method.GET && session.uri == "/list" -> list(path)
+                    json(
+                        JSONObject()
+                            .put("name", deviceName)
+                            .put("nav", tvNav.value.path)
+                            .put("seq", tvNav.value.seq)
+                            .put("tick", filesChanged.value),
+                    )
+                session.method == Method.GET && session.uri == "/list" -> {
+                    phoneNav.value = Nav(path.trim('/'), phoneNav.value.seq + 1)
+                    list(path)
+                }
                 session.method == Method.GET && session.uri == "/download" -> download(path)
                 session.method == Method.PUT && session.uri == "/upload" ->
                     receive(session, path, session.parms["name"] ?: "file")
@@ -69,9 +109,13 @@ class FileServer(
         newFixedLengthResponse(Response.Status.OK, "application/json", o.toString())
 
     private fun list(path: String): Response {
-        val dir = safeResolve(base, path)
         val dirs = JSONArray()
         val files = JSONArray()
+        if (path.trim('/').isEmpty() && roots.size > 1) {
+            roots.forEach { dirs.put(it.label) }
+            return json(JSONObject().put("dirs", dirs).put("files", files))
+        }
+        val dir = resolve(path)
         dir.listFiles()?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))?.forEach { f ->
             when {
                 f.isDirectory -> dirs.put(f.name)
@@ -85,14 +129,14 @@ class FileServer(
     }
 
     private fun download(path: String): Response {
-        val f = safeResolve(base, path)
+        val f = resolve(path)
         if (!f.isFile) return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "no such file")
         val mime = URLConnection.guessContentTypeFromName(f.name) ?: "application/octet-stream"
         return newFixedLengthResponse(Response.Status.OK, mime, FileInputStream(f), f.length())
     }
 
     private fun mkdir(path: String): Response {
-        val dir = safeResolve(base, path)
+        val dir = resolve(path)
         if (!dir.isDirectory && !dir.mkdirs()) throw IOException("could not create folder")
         filesChanged.value++
         return newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "ok")
@@ -101,7 +145,7 @@ class FileServer(
     private fun receive(session: IHTTPSession, path: String, rawName: String): Response {
         val total = session.headers["content-length"]?.toLongOrNull()
             ?: return newFixedLengthResponse(Response.Status.LENGTH_REQUIRED, MIME_PLAINTEXT, "Content-Length required")
-        val dir = safeResolve(base, path)
+        val dir = resolve(path)
         dir.mkdirs()
         val target = dedupe(dir, sanitize(rawName))
         // unique per-request staging file: concurrent uploads of the same name must never share one

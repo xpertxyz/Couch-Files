@@ -23,6 +23,24 @@ class FileServerTest {
     }
 
     @Test
+    fun resolveMapsRootsByLabel() {
+        val a = kotlin.io.path.createTempDirectory().toFile()
+        val b = kotlin.io.path.createTempDirectory().toFile()
+        try {
+            val srv = FileServer(0, listOf(Root("Couch Files", a), Root("Device storage", b)), "tv")
+            assertEquals(a.canonicalFile, srv.resolve("").canonicalFile)
+            assertEquals(a.canonicalFile, srv.resolve("Couch Files").canonicalFile)
+            assertEquals(File(b, "DCIM").canonicalFile, srv.resolve("Device storage/DCIM").canonicalFile)
+            // legacy phone paths (no root prefix) stay inside the first root
+            assertEquals(File(a, "sub/x").canonicalFile, srv.resolve("sub/x").canonicalFile)
+            assertThrows(SecurityException::class.java) { srv.resolve("Device storage/../etc") }
+        } finally {
+            a.deleteRecursively()
+            b.deleteRecursively()
+        }
+    }
+
+    @Test
     fun sanitizeStripsPathTraversal() {
         assertEquals("etc", FileServer.sanitize("../../etc"))
         assertEquals("passwd", FileServer.sanitize("/etc/passwd"))
