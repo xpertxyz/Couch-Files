@@ -14,8 +14,8 @@ android {
         // ponytail: minSdk 29 so downloads use MediaStore.Downloads with zero permission code
         minSdk = 29
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0.0b"
+        versionCode = 6
+        versionName = "1.0.6b"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

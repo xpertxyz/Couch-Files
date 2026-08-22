@@ -13,8 +13,8 @@ android {
         applicationId = "com.xpertxyz.sharetotv"
         minSdk = 28
         targetSdk = 37
-        versionCode = 5
-        versionName = "1.0.4b"
+        versionCode = 7
+        versionName = "1.0.6b"
 
     }
 
